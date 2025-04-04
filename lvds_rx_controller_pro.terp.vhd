@@ -10,6 +10,12 @@
 -- +-----------------------------------------------------------------------+
 -- Revision:            1.2
 -- Date:                Nov 5, 2024 (data plane verified; refine lane selection with sticky)
+-- +-----------------------------------------------------------------------+
+-- Revision:            1.3
+-- Date:                Mar 3, 2025 (fulfill CDC)
+-- +-----------------------------------------------------------------------+
+-- Revision:            1.4
+-- Date:                Mar 24, 2025 (wrap more CDCs)
 -- =========================================================================
 -- Description:         Controls and decodes data from 'altera_lvds_rx_28nm` IP. 
 -- Usage:                
@@ -34,6 +40,7 @@ library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 use ieee.std_logic_misc.or_reduce;
+use ieee.std_logic_misc.and_reduce;
 -- get params from hls* macro
 @@ set num_ports $n_avst_out_ports
 @@ set use_channel $use_channel_for_avst_out
@@ -147,6 +154,30 @@ architecture rtl of ${output_name} is
         rollover_errors     : rollover_errors_t;
     end record;
     signal csr              : csr_t;
+    signal dcsr             : csr_t;
+    
+    -- //////////////////////////////////////////////////
+    -- cdc_fifo
+    -- //////////////////////////////////////////////////
+    signal locking_monitor_ok               : std_logic_vector(N_LANE-1 downto 0); -- translate locking_monitor.OK -> binary; 1=ok, 0=bad
+    signal dlocking_monitor_ok              : std_logic_vector(N_LANE-1 downto 0);
+    constant CDC_C2D_WIDTH          : natural := csr.sync_pattern'length + csr.mode_mask'length + csr.soft_reset_req'length + locking_monitor_ok'length + 1; -- pipe=1
+    signal cdc_fifo_cdata           : std_logic_vector(39 downto 0);
+    signal cdc_fifo_ddata           : std_logic_vector(39 downto 0);   
+    signal cdc_fifo_cq              : std_logic_vector(39 downto 0);
+    signal cdc_fifo_dq              : std_logic_vector(39 downto 0);
+    
+    component cdc_fifo
+	port (
+		aclr		: in  std_logic  := '0';
+		data		: in  std_logic_vector(39 downto 0);
+		rdclk		: in  std_logic;
+		rdreq		: in  std_logic;
+		wrclk		: in  std_logic;
+		wrreq		: in  std_logic;
+		q		    : out std_logic_vector(39 downto 0)
+    );
+    end component;
     
     -- //////////////////////////////////////////////////
     --  locking_monitor  
@@ -217,10 +248,12 @@ architecture rtl of ${output_name} is
     type bit_sliper_counter_t is array (0 to N_LANE-1) of unsigned(15 downto 0);
     signal bit_sliper_counter           : bit_sliper_counter_t;
     
-    type bit_sliper_sync_cnt_t is array (0 to N_LANE-1) of unsigned(7 downto 0);
+    type bit_sliper_sync_cnt_t is array (0 to N_LANE-1) of unsigned(15 downto 0);
     signal bit_sliper_sync_cnt          : bit_sliper_sync_cnt_t;
     
     signal bit_sliper_valid             : std_logic_vector(N_LANE-1 downto 0);
+    
+    signal bit_sliper_trained           : std_logic_vector(N_LANE-1 downto 0);
     
     -- adaptive_aligner 
     type adaptive_aligner_t is (IDLE,DECIDING,LOCKING,LOCKED,RESET);
@@ -274,7 +307,9 @@ architecture rtl of ${output_name} is
     type pipes_t is record
         sliper2csr  : pipe_t;
     end record;
-    signal pipe     : pipes_t;
+    --signal pipe     : pipes_t;
+    signal dpipe    : pipes_t;
+    signal cpipe    : pipes_t;
     
     
     
@@ -321,15 +356,16 @@ architecture rtl of ${output_name} is
     
     
 begin
-    -- \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
-    -- generic_checks 
-    -- \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
-    assert N_LANE <= 32 report "N_LANE must be smaller than 32" severity error;
+    -- //////////////////////////////////////////////////
+    -- generic_checks
+    -- //////////////////////////////////////////////////
+    assert N_LANE <= 32 report "N_LANE must be smaller than or equal to 32" severity error;
     assert SYNC_PATTERN = "0011111010" report "SYNC PATTERN is not set to default, not k28.5" severity warning;
+    assert CDC_C2D_WIDTH <= cdc_fifo_cdata'length report "CDC FIFO is not wide enough" severity error;
 
-    -- \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+    -- //////////////////////////////////////////////////
     -- csr_interface
-    -- \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+    -- //////////////////////////////////////////////////
     proc_csr_interface : process (csi_control_clk, rsi_control_reset)
     begin
         if rising_edge(csi_control_clk) then 
@@ -368,7 +404,7 @@ begin
                         -- lane error counts
                         @@ for {set i 0} {$i < $num_ports} {incr i} {
                         when $i+5 => 
-                            avs_csr_readdata(31 downto 0)       <= csr.symbol_errors(${i});
+                            avs_csr_readdata(31 downto 0)       <= csr.symbol_errors(${i})(31 downto 0);
                         @@ }
                         -- debug registers (port-mapped)
                         when N_LANE+5 => -- port selection
@@ -421,13 +457,13 @@ begin
                         csr.dpa_unlocks(i)     <= std_logic_vector(locking_monitor_dpa_unlock_cnt(i));
                         
                         -- -> update the rollover_errors counters
-                        if (pipe.sliper2csr.start = '1' and pipe.sliper2csr.done = '0') then -- update request from sliper2csr
+                        if (cpipe.sliper2csr.start = '1' and cpipe.sliper2csr.done = '0') then -- update request from sliper2csr
                             csr.rollover_errors(i)      <= csr.rollover_errors(i) + 1;
-                            pipe.sliper2csr.done        <= '1'; -- ack the sliper
-                        elsif (pipe.sliper2csr.start = '1' and pipe.sliper2csr.done = '1') then -- wait for sliper to ack back
+                            cpipe.sliper2csr.done        <= '1'; -- ack the sliper
+                        elsif (cpipe.sliper2csr.start = '1' and cpipe.sliper2csr.done = '1') then -- wait for sliper to ack back
                             -- wait
-                        elsif (pipe.sliper2csr.start = '0' and pipe.sliper2csr.done = '1') then -- sliper ack'd
-                            pipe.sliper2csr.done        <= '0'; -- finish the routine
+                        elsif (cpipe.sliper2csr.start = '0' and cpipe.sliper2csr.done = '1') then -- sliper ack'd
+                            cpipe.sliper2csr.done        <= '0'; -- finish the routine
                         else
                             -- idle
                         end if;
@@ -446,6 +482,67 @@ begin
             end if;
         end if;
     end process;
+    
+    --
+    
+    proc_cdc_fifo_comb : process (all)
+    begin
+        -- default
+        cdc_fifo_cdata       <= (others => '0'); -- 40 bit
+        for i in 0 to N_LANE-1 loop 
+            if (locking_monitor(i) = OK) then 
+                locking_monitor_ok(i)       <= '1';
+            else 
+                locking_monitor_ok(i)       <= '0';
+            end if;
+        end loop;
+        -- connect
+        -- -- c2d (control to data)
+        -- -- -- sync_pattern
+        cdc_fifo_cdata(9 downto 0)      <= csr.sync_pattern;
+        dcsr.sync_pattern               <= cdc_fifo_dq(9 downto 0);
+        -- -- -- mode_mask
+        cdc_fifo_cdata(N_LANE+9 downto 10)      <= csr.mode_mask;
+        dcsr.mode_mask                          <= cdc_fifo_dq(N_LANE+9 downto 10);
+        -- -- -- soft_reset_req                 
+        cdc_fifo_cdata(2*N_LANE+9 downto N_LANE+10)     <= csr.soft_reset_req;
+        dcsr.soft_reset_req                             <= cdc_fifo_dq(2*N_LANE+9 downto N_LANE+10);
+        -- -- -- locking_monitor
+        cdc_fifo_cdata(3*N_LANE+9 downto 2*N_LANE+10)   <= locking_monitor_ok;
+        dlocking_monitor_ok                             <= cdc_fifo_dq(3*N_LANE+9 downto 2*N_LANE+10);
+        -- -- -- pipe
+        cdc_fifo_cdata(3*N_LANE+10)                     <= cpipe.sliper2csr.done;
+        dpipe.sliper2csr.done                           <= cdc_fifo_dq(3*N_LANE+10);
+        -- =======================
+        -- -- d2c (data to control)
+        -- -- -- pipe
+        cdc_fifo_ddata(0)                               <= dpipe.sliper2csr.start;
+        cpipe.sliper2csr.start                          <= cdc_fifo_cq(0);
+        -- -- -- symbol_errors
+        -- TODO...
+    end process;
+    
+    cdc_fifo_unit_c2d : cdc_fifo -- control to data 
+	port map (
+		aclr		=> rsi_control_reset,
+		data		=> cdc_fifo_cdata, -- 40 bit 
+		rdclk		=> csi_data_clk,
+		rdreq		=> '1',
+		wrclk		=> csi_control_clk,
+		wrreq		=> '1',
+		q		    => cdc_fifo_dq
+    );
+    
+    cdc_fifo_unit_d2c : cdc_fifo -- data to control
+	port map (
+		aclr		=> rsi_control_reset,
+		data		=> cdc_fifo_ddata, -- 40 bit 
+		rdclk		=> csi_control_clk,
+		rdreq		=> '1',
+		wrclk		=> csi_data_clk,
+		wrreq		=> '1',
+		q		    => cdc_fifo_cq
+    );
     
     
     
@@ -493,6 +590,7 @@ begin
                     -- ------------------    
                     -- main fsm logic
                     -- ------------------
+                    -- TODO: handle CDC from lvds_rx signal (data) to this fsm (control)
                     case locking_monitor(i) is
                         -- idle until this monitor of the lane is enabled
                         when IDLE =>
@@ -654,7 +752,16 @@ begin
                 -- word aliger main logic
                 -- ---------------------------
                 for i in 0 to N_LANE-1 loop
-                    case csr.mode_mask(i) is 
+                    -- ------------------------------------------------------
+                    -- form 10 possbilities of boundary alignments
+                    -- ------------------------------------------------------
+                    word_aligner_din(i)(9 downto 0)     <= coe_parallel_data(10*i+9 downto 10*i);
+                    word_aligner_din(i)(19 downto 10)   <= word_aligner_din(i)(9 downto 0);
+                    for j in 0 to 9 loop
+                        word_aligner_dout(i)(j)             <= word_aligner_din(i)(19-j downto 10-j); -- word_aligner_dout -> [ decoder ] -> errors -> scores (we examine this)
+                    end loop;
+                    
+                    case dcsr.mode_mask(i) is 
                         -- ------------------------------
                         -- -- 1) adaptive selection mode
                         -- ------------------------------
@@ -664,14 +771,6 @@ begin
                         -- @output      <word_aligner_chosen> - the chosen lane (0xff... = bad choice)
                         --              <adaptive_aligner> - state of the lane (LOCKED = good boundary)
                         when '1' => 
-                            -- ------------------------------------------------------
-                            -- form 10 possbilities of boundary alignments
-                            -- ------------------------------------------------------
-                            word_aligner_din(i)(9 downto 0)     <= coe_parallel_data(10*i+9 downto 10*i);
-                            word_aligner_din(i)(19 downto 10)   <= word_aligner_din(i)(9 downto 0);
-                            for j in 0 to 9 loop
-                                word_aligner_dout(i)(j)         <= word_aligner_din(i)(19-j downto 10-j); -- word_aligner_dout -> [ decoder ] -> errors -> scores (we examine this)
-                            end loop;
                             -- ------------------------------------------------------
                             -- tracking quality score of each choice
                             -- ------------------------------------------------------
@@ -693,7 +792,6 @@ begin
                             word_aligner_chosen(i)          <= (others => '1'); -- -1 (signed) or 32 (unsigned)
                             word_aligner_chosen_reflect(i)  <= (word_aligner_chosen_reflect(i)'high => '1', others => '0'); -- -16 (signed) or 16 (unsigned)
                             -- note: both are not possible in legal selection range of [0 9]; their defaults should be unequal.
-                            
                             
                             -- good score from lsb to msb
                             for j in 0 to 9 loop
@@ -761,10 +859,13 @@ begin
 
          
                             -- handle the reset request from csr
-                            if (csr.soft_reset_req(i) = '1' or locking_monitor(i) /= OK or or_reduce(adaptive_aligner_priority(i)) = '0') then -- bad signal from control plane
+                            if (dcsr.soft_reset_req(i) = '1' or dlocking_monitor_ok(i) /= '1' or or_reduce(adaptive_aligner_priority(i)) = '0') then -- bad signal from control plane
                                 word_aligner_din(i)         <= (others => '0'); -- this should be enough
                                 adaptive_aligner(i)         <= RESET; -- need for priority all zeros. TODO: debug this?
                             end if;
+                            
+                            -- turn off the other mode
+                            bit_sliper(i)       <= IDLE;
                             
                            
                         -- ------------------------------    
@@ -773,7 +874,7 @@ begin
                         -- @berief      Slips the bit until the correct word boundary is found. Monitor after found.
                         --
                         -- @input       <coe_parallel_data> - parallel 10b data from LVDS_RX IP
-                        --              <locking_monitor.OK> - parallel 10b data is valid
+                        --              <dlocking_monitor_ok> - parallel 10b data is valid
                         -- @output      <bit_sliper_valid> - flag to indicate the 10b data from LVDS_RX IP is well-aligned.
                         --              <pipe.sliper2csr.start> - if rollover is reached and no boundary can be found. 
                         --                                        this will trigger one update of the counter in csr. 
@@ -792,10 +893,12 @@ begin
                                 when MONITOR => -- monitor 
                                     if (bit_sliper_counter(i) < 4000) then -- TODO: tune this
                                         bit_sliper_counter_en(i)    <= '1';
-                                        if (coe_parallel_data(10*i+9 downto 10*i) = csr.sync_pattern or coe_parallel_data(10*i+9 downto 10*i) = not csr.sync_pattern) then 
+                                        if (coe_parallel_data(10*i+9 downto 10*i) = dcsr.sync_pattern or coe_parallel_data(10*i+9 downto 10*i) = not dcsr.sync_pattern) then 
                                             bit_sliper_sync_cnt(i)  <= bit_sliper_sync_cnt(i) + 1;
                                         end if;
-                                    else -- evaluation
+                                    elsif (bit_sliper_counter(i) = 4000) then
+                                        bit_sliper_counter_en(i)    <= '0';
+                                    else -- evaluation (4001+)
                                         bit_sliper_counter_en(i)    <= '0';
                                         bit_sliper_sync_cnt(i)      <= (others => '0');
                                         if (bit_sliper_sync_cnt(i) > 4) then -- requires 4 sync pattern in 2000 cycles, TODO: tune this
@@ -809,10 +912,10 @@ begin
                                         end if;
                                     end if;
                                     -- handle the reset request from csr
-                                    if (csr.soft_reset_req(i) = '1') then 
+                                    if (dcsr.soft_reset_req(i) = '1') then 
                                         -- reset counters 
-                                        bit_sliper(i)           <= IDLE;
-                                        pipe.sliper2csr.start   <= '0';
+                                        bit_sliper(i)               <= IDLE;
+                                        dpipe.sliper2csr.start      <= '0';
                                         bit_sliper_counter_en(i)    <= '0';
                                         bit_sliper_sync_cnt(i)      <= (others => '0');
                                         -- note: don't worry about current unfinished bit slips or early rollover, as the bitslip fifo should also be reset. 
@@ -820,28 +923,35 @@ begin
                                     end if;
                                 when OK =>
                                     -- continuously monitor, tracking the boundary
+                                    bit_sliper_trained(i)   <= '1'; -- status flag of lane trained 
                                     bit_sliper(i)           <= MONITOR;
                                     bit_sliper_valid(i)     <= '1'; -- raise this flag to indicate the parallel data is aligned and safe to use
                                 when FAIL =>
+                                    bit_sliper_trained(i)   <= '0';
                                     bit_sliper_valid(i)     <= '0'; -- lower this flag to indicate the parallel data is corrupt and re-alignment is in process
                                     -- 1) report error to csr
-                                    if (pipe.sliper2csr.start = '0' and pipe.sliper2csr.done = '0') then 
-                                        pipe.sliper2csr.start       <= '1';
-                                    elsif (pipe.sliper2csr.start = '1' and pipe.sliper2csr.done = '0') then -- wait for csr to ack
+                                    if (dpipe.sliper2csr.start = '0' and dpipe.sliper2csr.done = '0') then 
+                                        dpipe.sliper2csr.start      <= '1';
+                                    elsif (dpipe.sliper2csr.start = '1' and dpipe.sliper2csr.done = '0') then -- wait for csr to ack
                                         -- idle
-                                    elsif (pipe.sliper2csr.start = '1' and pipe.sliper2csr.done = '1') then -- csr ack'd it
-                                        pipe.sliper2csr.start       <= '0'; -- ack back
+                                    elsif (dpipe.sliper2csr.start = '1' and dpipe.sliper2csr.done = '1') then -- csr ack'd it
+                                        dpipe.sliper2csr.start      <= '0'; -- ack back
                                     else -- wait for csr to ack, escape early to prevent dead-lock 
                                     -- 2) slip again 
                                         bit_sliper(i)           <= SLIP;
                                     end if;
                                 when IDLE =>
-                                    if (locking_monitor(i) = OK) then 
+                                    bit_sliper_counter_en(i)    <= '0';
+                                    bit_sliper_trained(i)       <= '0';
+                                    if (dlocking_monitor_ok(i) = '1') then 
                                         bit_sliper(i)       <= SLIP;
                                     end if;
                                 when others =>
                                     null;
                             end case;
+                            
+                            -- turn off the other mode
+                            adaptive_aligner(i)     <= RESET;
                         when others =>
                             null;
                     end case;
@@ -860,11 +970,6 @@ begin
     end process;
     
     
-    
-    
-       
-    
-    
     proc_symbol_decoder : process (rsi_data_reset, csi_data_clk) 
     begin
         if rising_edge(csi_data_clk) then 
@@ -877,15 +982,13 @@ begin
                         for k in 0 to 9 loop -- per bit (reversal), NOTE: see above the reason why we need reversal
                             decoder_din(i)(j)(9-k)   <= word_aligner_dout(i)(j)(k);
                         end loop;
-                        if (locking_monitor(i) = OK) then -- block the decoder parity input if the dpa is not locked 
+                        if (dlocking_monitor_ok(i) = '1') then -- unblock the decoder parity input if the dpa is locked 
                             decoder_dispi(i)(j)    <= decoder_dispo(i)(j);
                         else
                             decoder_dispi(i)(j)    <= '0';
                         end if;
                     end loop;
                 end loop;
-                
-            
             end if;
         end if;
     end process;
@@ -902,7 +1005,7 @@ begin
                 -- constructing interface <decoded${p}>
                 -- #########################################
                 aso_decoded${p}_channel     <= std_logic_vector(to_unsigned(${p},aso_decoded${p}_channel'length));
-                case csr.mode_mask(${p}) is 
+                case dcsr.mode_mask(${p}) is 
                     when '1' => 
                         -- -------------------
                         -- for adaptive mode
@@ -938,8 +1041,20 @@ begin
                         end if;
                     
                     when '0' => 
-                        -- TODO
-                    
+                        -- -------------------
+                        -- for slip mode
+                        -- -------------------
+                        -- default
+                        aso_decoded${p}_error(2 downto 0)   <= "100"; -- untrained, so top bit has error 
+                        
+                        if (bit_sliper_trained(${p}) = '1') then 
+                            aso_decoded${p}_error(2)            <= '0'; -- trained, so no training error, showing the lower bits as minor errors
+                            aso_decoded${p}_error(1)            <= decoder_disperr(${p})(0); -- parity error
+                            aso_decoded${p}_error(0)            <= decoder_coderr(${p})(0); -- decode error
+                        end if;
+                        
+                        aso_decoded${p}_data                <= decoder_dout(${p})(0);
+                        
                     when others =>
                         null;
                 end case;
@@ -954,7 +1069,7 @@ begin
                 -- default
                 -- connect the derived data and error to the [decoded] interface output
                 for i in 0 to N_LANE-1 loop
-                    case csr.mode_mask(i) is 
+                    case dcsr.mode_mask(i) is 
                         when '1' =>
                             -- -------------------
                             -- for adaptive mode
@@ -1006,19 +1121,10 @@ begin
             end if;
         end if;
     
-    
     end process;
     
     
-    
-    
-
-
-
-
-
-
-
+   
 
 end architecture rtl;
 

@@ -1,12 +1,12 @@
 ################################################
-# lvds_rx_controller_pro "LVDS RX Controller Pro" v24.0.1110
-# Yifeng Wang 2024.10.11
+# lvds_rx_controller_pro "LVDS RX Controller Pro" v25.0.0324
+# Yifeng Wang 2025.01.24
 ################################################
 
 ################################################
 # request TCL package from ACDS 16.1
 ################################################ 
-package require qsys 16.1
+package require qsys
 # custom macro, for building .hdl.terp -> .hdl
 # loc: $::env(QUARTUS_ROOTDIR)/../ip/altera/common/hw_tcl_packages/altera_terp.tcl
 package require -exact altera_terp 1.0
@@ -16,7 +16,7 @@ package require -exact altera_terp 1.0
 # module lvds_rx_controller_pro
 ################################################ 
 set_module_property NAME lvds_rx_controller_pro
-set_module_property VERSION 24.0.1110
+set_module_property VERSION 25.0.0324
 set_module_property INTERNAL false
 set_module_property OPAQUE_ADDRESS_MAP true
 set_module_property GROUP "Mu3e Data Plane/Modules"
@@ -38,6 +38,7 @@ set_module_property ELABORATION_CALLBACK my_elaborate
 ################################################ 
 # derived
 add_parameter DECODED_CHANNEL_WIDTH natural 
+set_parameter_property DECODED_CHANNEL_WIDTH DISPLAY_NAME "Channel width of avalon streaming interface"
 set_parameter_property DECODED_CHANNEL_WIDTH HDL_PARAMETER true
 set_parameter_property DECODED_CHANNEL_WIDTH DERIVED true
 
@@ -54,7 +55,7 @@ set_parameter_property DECODED_USE_CHANNEL HDL_PARAMETER true
 set_parameter_property DECODED_USE_CHANNEL AFFECTS_ELABORATION true
 set dscpt \
 "<html>
-Group t <br>
+Group the datapath output interfaces for all lanes (enable~=simplied datapath in altera xcvr) <br>
 <ul>
     <li> <b>Enable</b>:  
             combine a single-port with all data concat. into large array, lower index in LSB. <br> </li>
@@ -199,10 +200,13 @@ proc my_generate { output_name } {
     set params(output_name) $output_name
 
     set result          [ altera_terp $template params ]
-
+    
+    # top level file including controller and free-running CSR - HDL version 1.4
     add_fileset_file ${output_name}.vhd VHDL TEXT $result TOP_LEVEL_FILE
-    #add_fileset_file ${output_name}.vhd VHDL PATH ${output_name}.vhd TOP_LEVEL_FILE
+    # 8b/10b decoder (3rd party) - HDL 1.0
     add_fileset_file line_code_decoder_8b10b.v Verilog PATH line_code_decoder_8b10b.v
+    # cdc fifos (altera) - HDL 1.0
+    add_fileset_file cdc_fifo.vhd VHDL PATH alt_fifo/cdc_fifo.vhd
 }
 
 
